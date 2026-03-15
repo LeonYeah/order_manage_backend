@@ -1,1 +1,5 @@
-﻿flask
+flask
+flask-cors
+mysqlclient
+bcrypt
+PyJWT
