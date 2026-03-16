@@ -1,3 +1,32 @@
+# IDE and editor files
 .idea/
-*.iml
 .vscode/
+*.iml
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local environment and secrets
+.env
+.env.*
+
+# Logs and local databases
+*.log
+*.sqlite3
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+target/
+
+# Non-core project files
+reset_admin_password.py
