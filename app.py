@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
@@ -26,6 +26,7 @@ PAYMENT_METHODS = {"微信", "支付宝", "现金"}
 REVIEW_STATUS_PENDING = "未审核"
 REVIEW_STATUS_REJECTED = "已驳回"
 REVIEW_STATUS_APPROVED = "已通过"
+ORDER_NUMBER_LOCK_NAME = "orders_order_number_lock"
 
 
 def get_db():
@@ -145,12 +146,142 @@ def ensure_order_settlement_schema():
         db.close()
 
 
+def ensure_order_recipient_schema():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'recipient_name'")
+        has_recipient_name = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'recipient_address'")
+        has_recipient_address = cursor.fetchone()
+
+        if not has_recipient_name:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN recipient_name VARCHAR(100) NULL AFTER customer_name"
+            )
+        if not has_recipient_address:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN recipient_address VARCHAR(255) NULL AFTER recipient_name"
+            )
+
+        cursor.execute(
+            "UPDATE orders SET recipient_name = customer_name "
+            "WHERE (recipient_name IS NULL OR recipient_name='') AND customer_name IS NOT NULL"
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def ensure_order_items_color_schema():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("SHOW COLUMNS FROM order_items LIKE 'color'")
+        has_color = cursor.fetchone()
+        if not has_color:
+            cursor.execute(
+                "ALTER TABLE order_items ADD COLUMN color VARCHAR(50) NULL AFTER amount"
+            )
+            db.commit()
+    finally:
+        db.close()
+
+
+def ensure_order_staff_schema():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'order_clerk'")
+        has_order_clerk = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'salesperson'")
+        has_salesperson = cursor.fetchone()
+
+        if not has_order_clerk:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN order_clerk VARCHAR(100) NULL AFTER clerk_id"
+            )
+        if not has_salesperson:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN salesperson VARCHAR(100) NULL AFTER order_clerk"
+            )
+
+        cursor.execute(
+            "UPDATE orders o "
+            "LEFT JOIN users u ON u.id = o.clerk_id "
+            "SET o.order_clerk = IFNULL(u.username, o.order_clerk) "
+            "WHERE (o.order_clerk IS NULL OR o.order_clerk='')"
+        )
+        cursor.execute("UPDATE orders SET salesperson=NULL WHERE salesperson IS NOT NULL")
+        db.commit()
+    finally:
+        db.close()
+
+
+def ensure_order_draft_schema():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS draft_orders (
+              id BIGINT NOT NULL AUTO_INCREMENT,
+              customer_name VARCHAR(100) NULL,
+              salesperson VARCHAR(100) NULL,
+              recipient_name VARCHAR(100) NULL,
+              recipient_address VARCHAR(255) NULL,
+              clerk_id BIGINT NOT NULL,
+              order_clerk VARCHAR(100) NULL,
+              order_date DATE NULL,
+              shipping_fee DECIMAL(10,2) NOT NULL DEFAULT 0,
+              discount_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+              total_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+              settlement_status ENUM('未结账','已结账') NOT NULL DEFAULT '未结账',
+              payment_method VARCHAR(20) NULL,
+              remark VARCHAR(500) NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              KEY idx_draft_orders_clerk_id (clerk_id),
+              KEY idx_draft_orders_order_date (order_date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS draft_order_items (
+              id BIGINT NOT NULL AUTO_INCREMENT,
+              draft_order_id BIGINT NOT NULL,
+              product_id BIGINT NOT NULL,
+              quantity INT NOT NULL DEFAULT 1,
+              unit_price DECIMAL(10,2) NOT NULL DEFAULT 0,
+              amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+              color VARCHAR(50) NULL,
+              sample_date DATE NULL,
+              remark VARCHAR(500) NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              KEY idx_draft_order_items_draft_order_id (draft_order_id),
+              KEY idx_draft_order_items_product_id (product_id),
+              CONSTRAINT fk_draft_order_items_draft_order
+                FOREIGN KEY (draft_order_id) REFERENCES draft_orders(id)
+                ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def parse_order_date(value):
     if not value:
         return datetime.now().date()
 
     if isinstance(value, datetime):
         return value.date()
+    if isinstance(value, date):
+        return value
 
     if isinstance(value, str):
         normalized = value.strip()
@@ -242,9 +373,36 @@ def generate_order_number(cursor, order_date):
         (f"{prefix}%",),
     )
     latest = cursor.fetchone()
-    last_number = latest[0] if latest else None
+    last_number = _get_first_column(latest) if latest else None
     next_sequence = int(last_number[-4:]) + 1 if last_number else 1
     return f"{prefix}{next_sequence:04d}"
+
+
+def acquire_order_number_lock(cursor, timeout_seconds=10):
+    cursor.execute("SELECT GET_LOCK(%s, %s)", (ORDER_NUMBER_LOCK_NAME, timeout_seconds))
+    result = cursor.fetchone()
+    lock_status = _get_first_column(result)
+    if lock_status != 1:
+        raise RuntimeError("order_number_lock_timeout")
+
+
+def release_order_number_lock(cursor):
+    try:
+        cursor.execute("SELECT RELEASE_LOCK(%s)", (ORDER_NUMBER_LOCK_NAME,))
+    except Exception:
+        pass
+
+
+def _get_first_column(row):
+    if row is None:
+        return None
+    if isinstance(row, (list, tuple)):
+        return row[0] if row else None
+    if isinstance(row, dict):
+        for _, value in row.items():
+            return value
+        return None
+    return row
 
 
 def normalize_role(role):
@@ -253,6 +411,16 @@ def normalize_role(role):
     if role in ("clerk", "CLERK", "制单员"):
         return "clerk"
     return role
+
+
+def get_username_by_user_id(cursor, user_id):
+    cursor.execute("SELECT username FROM users WHERE id=%s", (user_id,))
+    user = cursor.fetchone()
+    if not user:
+        return ""
+    if isinstance(user, (list, tuple)):
+        return user[0] or ""
+    return user.get("username") or ""
 
 
 @app.route("/api/login", methods=["POST"])
@@ -341,6 +509,7 @@ def get_products():
 
 
 @app.route("/api/products", methods=["POST"])
+@auth_required()
 def add_product():
     data = request.json
     db = get_db()
@@ -361,7 +530,7 @@ def add_product():
 
 
 @app.route("/api/products/<int:product_id>", methods=["PUT"])
-@auth_required(required_role="admin")
+@auth_required()
 def update_product(product_id):
     data = request.json or {}
     name = (data.get("name") or "").strip()
@@ -388,6 +557,479 @@ def update_product(product_id):
     db.commit()
     db.close()
     return jsonify({"msg": "product updated"})
+
+
+@app.route("/api/products/batch-delete", methods=["POST"])
+@auth_required()
+def batch_delete_products():
+    data = request.json or {}
+    raw_ids = data.get("ids") or []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return jsonify({"msg": "ids are required"}), 400
+
+    product_ids = []
+    for value in raw_ids:
+        try:
+            product_id = int(value)
+        except (TypeError, ValueError):
+            return jsonify({"msg": "invalid ids"}), 400
+        if product_id > 0 and product_id not in product_ids:
+            product_ids.append(product_id)
+
+    if not product_ids:
+        return jsonify({"msg": "ids are required"}), 400
+
+    placeholders = ",".join(["%s"] * len(product_ids))
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    try:
+        cursor.execute(
+            f"SELECT DISTINCT p.id, p.name "
+            f"FROM products p JOIN order_items oi ON oi.product_id=p.id "
+            f"WHERE p.id IN ({placeholders})",
+            product_ids,
+        )
+        used_products = cursor.fetchall()
+        if used_products:
+            used_names = [item.get("name") or str(item.get("id")) for item in used_products]
+            return jsonify({"msg": f"以下商品已被订单使用，无法删除：{','.join(used_names)}"}), 400
+
+        cursor.execute(
+            f"DELETE FROM products WHERE id IN ({placeholders})",
+            product_ids,
+        )
+        deleted_count = cursor.rowcount
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return jsonify({"msg": "products deleted", "deleted_count": deleted_count})
+
+
+@app.route("/api/order-drafts", methods=["POST"])
+@auth_required()
+def create_order_draft():
+    data = request.json or {}
+    items = data.get("items") or []
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    try:
+        order_date = parse_order_date(data.get("order_date"))
+    except ValueError:
+        return jsonify({"msg": "invalid order_date"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        clerk_id = data.get("clerk_id") or current_user_id
+        if current_role != "admin":
+            clerk_id = current_user_id
+        order_clerk = get_username_by_user_id(cursor, clerk_id)
+        customer_name = (data.get("customer_name") or "").strip() or None
+        salesperson = (data.get("salesperson") or "").strip() or None
+        recipient_name = (data.get("recipient_name") or "").strip() or None
+        recipient_address = (data.get("recipient_address") or "").strip() or None
+        shipping_fee = float(data.get("shipping_fee") or 0)
+        discount_amount = float(data.get("discount_amount") or 0)
+        total_amount = float(data.get("total_amount") or 0)
+        settlement_status = normalize_settlement_status(data.get("settlement_status") or SETTLEMENT_STATUS_UNSETTLED)
+        payment_method = normalize_payment_method(data.get("payment_method"), settlement_status)
+        remark = (data.get("remark") or "").strip() or None
+
+        cursor.execute(
+            "INSERT INTO draft_orders (customer_name, salesperson, recipient_name, recipient_address, clerk_id, order_clerk, "
+            "order_date, shipping_fee, discount_amount, total_amount, settlement_status, payment_method, remark) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                customer_name,
+                salesperson,
+                recipient_name,
+                recipient_address,
+                clerk_id,
+                order_clerk,
+                order_date.strftime("%Y-%m-%d"),
+                shipping_fee,
+                discount_amount,
+                total_amount,
+                settlement_status,
+                payment_method,
+                remark,
+            ),
+        )
+        draft_id = cursor.lastrowid
+
+        for item in items:
+            product_id = item.get("product_id")
+            if not product_id:
+                continue
+            quantity = int(item.get("quantity") or 1)
+            unit_price = float(item.get("unit_price") or 0)
+            amount = float(item.get("amount") or 0)
+            color = (item.get("color") or "").strip() or None
+            sample_date = item.get("sample_date")
+            sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
+            item_remark = (item.get("remark") or "").strip() or None
+            cursor.execute(
+                "INSERT INTO draft_order_items (draft_order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    draft_id,
+                    product_id,
+                    quantity,
+                    unit_price,
+                    amount,
+                    color,
+                    sample_date_value,
+                    item_remark,
+                ),
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return jsonify({"msg": "draft saved", "draft_id": draft_id})
+
+
+@app.route("/api/order-drafts", methods=["GET"])
+@auth_required()
+def get_order_drafts():
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+    clerk_id = request.args.get("clerk_id", type=int)
+    user_name = (request.args.get("user_name") or "").strip()
+    start_date = (request.args.get("start_date") or "").strip()
+    end_date = (request.args.get("end_date") or "").strip()
+
+    query = [
+        "SELECT d.*, u.username AS clerk_name, COUNT(di.id) AS item_count",
+        "FROM draft_orders d",
+        "LEFT JOIN users u ON u.id = d.clerk_id",
+        "LEFT JOIN draft_order_items di ON di.draft_order_id = d.id",
+        "WHERE 1=1",
+    ]
+    params = []
+
+    if current_role != "admin":
+        query.append("AND d.clerk_id=%s")
+        params.append(current_user_id)
+    elif clerk_id:
+        query.append("AND d.clerk_id=%s")
+        params.append(clerk_id)
+    if user_name:
+        query.append("AND u.username LIKE %s")
+        params.append(f"%{user_name}%")
+
+    if start_date:
+        try:
+            start_date_obj = parse_order_date(start_date)
+        except ValueError:
+            return jsonify({"msg": "invalid start_date"}), 400
+        query.append("AND d.order_date >= %s")
+        params.append(start_date_obj.strftime("%Y-%m-%d"))
+
+    if end_date:
+        try:
+            end_date_obj = parse_order_date(end_date)
+        except ValueError:
+            return jsonify({"msg": "invalid end_date"}), 400
+        query.append("AND d.order_date <= %s")
+        params.append(end_date_obj.strftime("%Y-%m-%d"))
+
+    query.append("GROUP BY d.id")
+    query.append("ORDER BY d.updated_at DESC, d.id DESC")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute(" ".join(query), params)
+    drafts = cursor.fetchall()
+    db.close()
+    return jsonify(drafts)
+
+
+@app.route("/api/order-drafts/<int:draft_id>", methods=["DELETE"])
+@auth_required()
+def delete_order_draft(draft_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute("SELECT id, clerk_id FROM draft_orders WHERE id=%s", (draft_id,))
+    draft = cursor.fetchone()
+    if not draft:
+        db.close()
+        return jsonify({"msg": "draft not found"}), 404
+    if current_role != "admin" and draft.get("clerk_id") != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+
+    cursor.execute("DELETE FROM draft_orders WHERE id=%s", (draft_id,))
+    db.commit()
+    db.close()
+    return jsonify({"msg": "draft deleted"})
+
+
+@app.route("/api/order-drafts/<int:draft_id>", methods=["GET"])
+@auth_required()
+def get_order_draft_detail(draft_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute("SELECT d.*, u.username AS clerk_name FROM draft_orders d LEFT JOIN users u ON u.id=d.clerk_id WHERE d.id=%s", (draft_id,))
+    draft = cursor.fetchone()
+    if not draft:
+        db.close()
+        return jsonify({"msg": "draft not found"}), 404
+    if current_role != "admin" and draft.get("clerk_id") != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+
+    cursor.execute(
+        "SELECT di.*, p.name AS product_name, p.product_code, p.english_name, p.capacity "
+        "FROM draft_order_items di JOIN products p ON p.id=di.product_id WHERE di.draft_order_id=%s ORDER BY di.id ASC",
+        (draft_id,),
+    )
+    items = cursor.fetchall()
+    db.close()
+    draft["items"] = items
+    return jsonify(draft)
+
+
+@app.route("/api/order-drafts/<int:draft_id>", methods=["PUT"])
+@auth_required()
+def update_order_draft(draft_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+    data = request.json or {}
+    items = data.get("items") or []
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor_plain = db.cursor()
+    cursor.execute("SELECT * FROM draft_orders WHERE id=%s", (draft_id,))
+    draft = cursor.fetchone()
+    if not draft:
+        db.close()
+        return jsonify({"msg": "draft not found"}), 404
+    if current_role != "admin" and draft.get("clerk_id") != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+
+    customer_name = (data.get("customer_name") or "").strip()
+    if not customer_name:
+        db.close()
+        return jsonify({"msg": "customer_name is required"}), 400
+    if not items:
+        db.close()
+        return jsonify({"msg": "items are required"}), 400
+
+    try:
+        order_date = parse_order_date(data.get("order_date"))
+    except ValueError:
+        db.close()
+        return jsonify({"msg": "invalid order_date"}), 400
+
+    clerk_id = draft.get("clerk_id")
+    order_clerk = get_username_by_user_id(cursor_plain, clerk_id)
+    salesperson = (data.get("salesperson") or "").strip() or None
+    recipient_name = (data.get("recipient_name") or customer_name).strip()
+    recipient_address = (data.get("recipient_address") or "").strip() or None
+    shipping_fee = float(data.get("shipping_fee") or 0)
+    discount_amount = float(data.get("discount_amount") or 0)
+    total_amount = float(data.get("total_amount") or 0)
+    settlement_status = normalize_settlement_status(data.get("settlement_status") or draft.get("settlement_status"))
+    payment_method = normalize_payment_method(data.get("payment_method"), settlement_status)
+    remark = (data.get("remark") or "").strip() or None
+
+    try:
+        cursor_plain.execute(
+            "UPDATE draft_orders SET customer_name=%s, salesperson=%s, recipient_name=%s, recipient_address=%s, "
+            "order_clerk=%s, order_date=%s, shipping_fee=%s, discount_amount=%s, total_amount=%s, "
+            "settlement_status=%s, payment_method=%s, remark=%s WHERE id=%s",
+            (
+                customer_name,
+                salesperson,
+                recipient_name,
+                recipient_address,
+                order_clerk,
+                order_date.strftime("%Y-%m-%d"),
+                shipping_fee,
+                discount_amount,
+                total_amount,
+                settlement_status,
+                payment_method,
+                remark,
+                draft_id,
+            ),
+        )
+        cursor_plain.execute("DELETE FROM draft_order_items WHERE draft_order_id=%s", (draft_id,))
+
+        for item in items:
+            product_id = item.get("product_id")
+            if not product_id:
+                continue
+            sample_date = item.get("sample_date")
+            sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
+            cursor_plain.execute(
+                "INSERT INTO draft_order_items (draft_order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    draft_id,
+                    product_id,
+                    int(item.get("quantity") or 1),
+                    float(item.get("unit_price") or 0),
+                    float(item.get("amount") or 0),
+                    (item.get("color") or "").strip() or None,
+                    sample_date_value,
+                    (item.get("remark") or "").strip() or None,
+                ),
+            )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return jsonify({"msg": "draft updated"})
+
+
+@app.route("/api/order-drafts/<int:draft_id>/confirm", methods=["POST"])
+@auth_required()
+def confirm_order_draft(draft_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor_plain = db.cursor()
+    cursor.execute("SELECT * FROM draft_orders WHERE id=%s", (draft_id,))
+    draft = cursor.fetchone()
+    if not draft:
+        db.close()
+        return jsonify({"msg": "draft not found"}), 404
+    if current_role != "admin" and draft.get("clerk_id") != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+
+    cursor.execute(
+        "SELECT product_id, quantity, unit_price, amount, color, sample_date, remark "
+        "FROM draft_order_items WHERE draft_order_id=%s ORDER BY id ASC",
+        (draft_id,),
+    )
+    items = cursor.fetchall()
+    if not items:
+        db.close()
+        return jsonify({"msg": "draft items are required"}), 400
+
+    customer_name = (draft.get("customer_name") or "").strip()
+    if not customer_name:
+        db.close()
+        return jsonify({"msg": "customer_name is required"}), 400
+
+    order_date = parse_order_date(draft.get("order_date"))
+    settlement_status = normalize_settlement_status(draft.get("settlement_status"))
+    payment_method = normalize_payment_method(draft.get("payment_method"), settlement_status)
+    settlement_status, payment_method, settlement_remind_until, settlement_at = build_settlement_fields(
+        None,
+        {"settlement_status": settlement_status, "payment_method": payment_method},
+    )
+    review_status = get_default_review_status_for_settlement(settlement_status)
+    clerk_id = draft.get("clerk_id")
+    order_clerk = (draft.get("order_clerk") or "").strip() or get_username_by_user_id(cursor_plain, clerk_id)
+    salesperson = (draft.get("salesperson") or "").strip() or None
+    recipient_name = (draft.get("recipient_name") or customer_name).strip()
+    recipient_address = (draft.get("recipient_address") or "").strip() or None
+    shipping_fee = float(draft.get("shipping_fee") or 0)
+    discount_amount = float(draft.get("discount_amount") or 0)
+    total_amount = float(draft.get("total_amount") or 0)
+    remark = (draft.get("remark") or "").strip() or None
+    order_lock_acquired = False
+
+    try:
+        acquire_order_number_lock(cursor_plain, timeout_seconds=10)
+        order_lock_acquired = True
+        order_number = generate_order_number(cursor_plain, order_date)
+        cursor_plain.execute(
+            "INSERT INTO orders (order_number, customer_name, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, "
+            "shipping_fee, discount_amount, total_amount, payment_method, settlement_status, settlement_remind_until, settlement_at, review_status, "
+            "reject_reason, rejected_by, rejected_at, resubmitted_at, remark) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                order_number,
+                customer_name,
+                recipient_name,
+                recipient_address,
+                clerk_id,
+                order_clerk,
+                salesperson,
+                order_date.strftime("%Y-%m-%d"),
+                shipping_fee,
+                discount_amount,
+                total_amount,
+                payment_method,
+                settlement_status,
+                settlement_remind_until.strftime("%Y-%m-%d %H:%M:%S") if settlement_remind_until else None,
+                settlement_at.strftime("%Y-%m-%d %H:%M:%S") if settlement_at else None,
+                review_status,
+                None,
+                None,
+                None,
+                None,
+                remark,
+            ),
+        )
+        order_id = cursor_plain.lastrowid
+
+        for item in items:
+            sample_date = item.get("sample_date")
+            sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
+            cursor_plain.execute(
+                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    order_id,
+                    item.get("product_id"),
+                    item.get("quantity") or 1,
+                    item.get("unit_price") or 0,
+                    item.get("amount") or 0,
+                    (item.get("color") or "").strip() or None,
+                    sample_date_value,
+                    item.get("remark"),
+                ),
+            )
+
+        cursor_plain.execute("DELETE FROM draft_orders WHERE id=%s", (draft_id,))
+        db.commit()
+    except RuntimeError as exc:
+        db.rollback()
+        if str(exc) == "order_number_lock_timeout":
+            return jsonify({"msg": "订单编号生成繁忙，请稍后重试"}), 503
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if order_lock_acquired:
+            release_order_number_lock(cursor_plain)
+        db.close()
+
+    return jsonify({"msg": "draft confirmed", "order_id": order_id, "order_number": order_number})
 
 
 @app.route("/api/orders/next-number", methods=["GET"])
@@ -423,22 +1065,33 @@ def create_order():
 
     db = get_db()
     cursor = db.cursor()
+    order_lock_acquired = False
     try:
+        acquire_order_number_lock(cursor, timeout_seconds=10)
+        order_lock_acquired = True
         order_number = generate_order_number(cursor, order_date)
         clerk_id = data.get("clerk_id") or g.current_user.get("user_id")
+        order_clerk = get_username_by_user_id(cursor, clerk_id)
+        salesperson = (data.get("salesperson") or "").strip() or None
         shipping_fee = float(data.get("shipping_fee") or 0)
         discount_amount = float(data.get("discount_amount") or 0)
         total_amount = float(data.get("total_amount") or 0)
+        recipient_name = (data.get("recipient_name") or customer_name).strip()
+        recipient_address = (data.get("recipient_address") or "").strip() or None
         settlement_status, payment_method, settlement_remind_until, settlement_at = build_settlement_fields(None, data)
         review_status = get_default_review_status_for_settlement(settlement_status)
         remark = data.get("remark")
 
         cursor.execute(
-            "INSERT INTO orders (order_number, customer_name, clerk_id, order_date, shipping_fee, discount_amount, total_amount, payment_method, settlement_status, settlement_remind_until, settlement_at, review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO orders (order_number, customer_name, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, shipping_fee, discount_amount, total_amount, payment_method, settlement_status, settlement_remind_until, settlement_at, review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 order_number,
                 customer_name,
+                recipient_name,
+                recipient_address,
                 clerk_id,
+                order_clerk,
+                salesperson,
                 order_date.strftime("%Y-%m-%d"),
                 shipping_fee,
                 discount_amount,
@@ -460,22 +1113,30 @@ def create_order():
             sample_date = item.get("sample_date")
             sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
             cursor.execute(
-                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, sample_date, remark) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     order_id,
                     item["product_id"],
                     item["quantity"],
                     item.get("unit_price") or 0,
                     item.get("amount") or 0,
+                    (item.get("color") or "").strip() or None,
                     sample_date_value,
                     item.get("remark"),
                 ),
             )
         db.commit()
+    except RuntimeError as exc:
+        db.rollback()
+        if str(exc) == "order_number_lock_timeout":
+            return jsonify({"msg": "订单编号生成繁忙，请稍后重试"}), 503
+        raise
     except Exception:
         db.rollback()
         raise
     finally:
+        if order_lock_acquired:
+            release_order_number_lock(cursor)
         db.close()
 
     return jsonify({"msg": "order created", "order_id": order_id, "order_number": order_number})
@@ -494,13 +1155,14 @@ def get_orders():
     payment_method = (request.args.get("payment_method") or "").strip()
     settlement_status = (request.args.get("settlement_status") or "").strip()
     review_status = (request.args.get("review_status") or "").strip()
+    salesperson = (request.args.get("salesperson") or "").strip()
     order_number = (request.args.get("order_number") or "").strip()
     start_date = (request.args.get("start_date") or "").strip()
     end_date = (request.args.get("end_date") or "").strip()
     reminder_only = request.args.get("reminder_only") in ("1", "true", "True")
 
     query = [
-        "SELECT o.*, u.username AS clerk_name, rb.username AS rejected_by_name",
+        "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name, rb.username AS rejected_by_name",
         "FROM orders o",
         "LEFT JOIN users u ON u.id = o.clerk_id",
         "LEFT JOIN users rb ON rb.id = o.rejected_by",
@@ -534,6 +1196,10 @@ def get_orders():
     if review_status:
         query.append("AND o.review_status=%s")
         params.append(review_status)
+
+    if salesperson:
+        query.append("AND o.salesperson LIKE %s")
+        params.append(f"%{salesperson}%")
 
     if order_number:
         query.append("AND o.order_number LIKE %s")
@@ -582,7 +1248,7 @@ def get_order(order_id):
     db = get_db()
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
     cursor.execute(
-        "SELECT o.*, u.username AS clerk_name, rb.username AS rejected_by_name FROM orders o "
+        "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name, rb.username AS rejected_by_name FROM orders o "
         "LEFT JOIN users u ON u.id = o.clerk_id "
         "LEFT JOIN users rb ON rb.id = o.rejected_by WHERE o.id=%s",
         (order_id,),
@@ -650,6 +1316,9 @@ def update_order(order_id):
             shipping_fee = float(data.get("shipping_fee") or 0)
             discount_amount = float(data.get("discount_amount") or 0)
             total_amount = float(data.get("total_amount") or 0)
+            recipient_name = (data.get("recipient_name") or customer_name).strip()
+            recipient_address = (data.get("recipient_address") or "").strip() or None
+            salesperson = (data.get("salesperson") or "").strip() or None
             settlement_status, payment_method, settlement_remind_until, settlement_at = build_settlement_fields(order, data)
             review_status = normalize_review_status(order.get("review_status"))
             reject_reason = order.get("reject_reason")
@@ -676,12 +1345,14 @@ def update_order(order_id):
             remark = data.get("remark")
 
             cursor.execute(
-                "UPDATE orders SET customer_name=%s, order_date=%s, shipping_status=%s, shipping_time=%s, "
+                "UPDATE orders SET customer_name=%s, recipient_name=%s, recipient_address=%s, order_date=%s, shipping_status=%s, shipping_time=%s, "
                 "tracking_number=%s, payment_method=%s, settlement_status=%s, settlement_remind_until=%s, settlement_at=%s, "
                 "review_status=%s, reject_reason=%s, rejected_by=%s, rejected_at=%s, resubmitted_at=%s, "
-                "total_amount=%s, shipping_fee=%s, discount_amount=%s, remark=%s WHERE id=%s",
+                "total_amount=%s, shipping_fee=%s, discount_amount=%s, salesperson=%s, remark=%s WHERE id=%s",
                 (
                     customer_name,
+                    recipient_name,
+                    recipient_address,
                     order_date.strftime("%Y-%m-%d"),
                     shipping_status,
                     shipping_time,
@@ -698,6 +1369,7 @@ def update_order(order_id):
                     total_amount,
                     shipping_fee,
                     discount_amount,
+                    salesperson,
                     remark,
                     order_id,
                 ),
@@ -708,14 +1380,15 @@ def update_order(order_id):
                 sample_date = item.get("sample_date")
                 sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
                 cursor.execute(
-                    "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, sample_date, remark) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         order_id,
                         item["product_id"],
                         item["quantity"],
                         item.get("unit_price") or 0,
                         item.get("amount") or 0,
+                        (item.get("color") or "").strip() or None,
                         sample_date_value,
                         item.get("remark"),
                     ),
@@ -740,6 +1413,163 @@ def update_order(order_id):
     return jsonify({"msg": "order updated"})
 
 
+@app.route("/api/orders/<int:order_id>", methods=["DELETE"])
+@auth_required()
+def delete_order(order_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute("SELECT id, clerk_id, shipping_status FROM orders WHERE id=%s", (order_id,))
+    order = cursor.fetchone()
+    if not order:
+        db.close()
+        return jsonify({"msg": "order not found"}), 404
+    if current_role != "admin" and order["clerk_id"] != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+
+    shipping_status = (order.get("shipping_status") or "").strip() or "未发货"
+    if shipping_status == "已发货":
+        db.close()
+        return jsonify({"msg": "已发货订单不可删除"}), 400
+
+    try:
+        cursor.execute("DELETE FROM order_items WHERE order_id=%s", (order_id,))
+        cursor.execute("DELETE FROM orders WHERE id=%s", (order_id,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return jsonify({"msg": "order deleted"})
+
+
+@app.route("/api/orders/<int:order_id>/copy", methods=["POST"])
+@auth_required()
+def copy_order(order_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor_plain = db.cursor()
+    cursor.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
+    source_order = cursor.fetchone()
+    if not source_order:
+        db.close()
+        return jsonify({"msg": "order not found"}), 404
+    if current_role != "admin" and source_order.get("clerk_id") != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+
+    cursor.execute(
+        "SELECT product_id, quantity, unit_price, amount, color, sample_date, remark "
+        "FROM order_items WHERE order_id=%s ORDER BY id ASC",
+        (order_id,),
+    )
+    source_items = cursor.fetchall()
+    if not source_items:
+        db.close()
+        return jsonify({"msg": "source order items not found"}), 400
+
+    new_order_date = datetime.now().date()
+    settlement_status = normalize_settlement_status(source_order.get("settlement_status"))
+    payment_method = normalize_payment_method(source_order.get("payment_method"), settlement_status)
+    settlement_status, payment_method, settlement_remind_until, settlement_at = build_settlement_fields(
+        None,
+        {
+            "settlement_status": settlement_status,
+            "payment_method": payment_method,
+        },
+    )
+    review_status = get_default_review_status_for_settlement(settlement_status)
+    shipping_status = "未发货"
+    shipping_time = None
+    tracking_number = None
+    clerk_id = current_user_id
+    order_clerk = get_username_by_user_id(cursor_plain, clerk_id)
+    salesperson = (source_order.get("salesperson") or "").strip() or None
+    order_lock_acquired = False
+
+    try:
+        acquire_order_number_lock(cursor_plain, timeout_seconds=10)
+        order_lock_acquired = True
+        new_order_number = generate_order_number(cursor_plain, new_order_date)
+        cursor_plain.execute(
+            "INSERT INTO orders (order_number, customer_name, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, "
+            "shipping_status, shipping_time, tracking_number, shipping_fee, discount_amount, total_amount, payment_method, "
+            "settlement_status, settlement_remind_until, settlement_at, review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, remark) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (
+                new_order_number,
+                source_order.get("customer_name"),
+                source_order.get("recipient_name"),
+                source_order.get("recipient_address"),
+                clerk_id,
+                order_clerk,
+                salesperson,
+                new_order_date.strftime("%Y-%m-%d"),
+                shipping_status,
+                shipping_time,
+                tracking_number,
+                source_order.get("shipping_fee") or 0,
+                source_order.get("discount_amount") or 0,
+                source_order.get("total_amount") or 0,
+                payment_method,
+                settlement_status,
+                settlement_remind_until.strftime("%Y-%m-%d %H:%M:%S") if settlement_remind_until else None,
+                settlement_at.strftime("%Y-%m-%d %H:%M:%S") if settlement_at else None,
+                review_status,
+                None,
+                None,
+                None,
+                None,
+                source_order.get("remark"),
+            ),
+        )
+        new_order_id = cursor_plain.lastrowid
+
+        for item in source_items:
+            sample_date = item.get("sample_date")
+            sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
+            cursor_plain.execute(
+                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    new_order_id,
+                    item.get("product_id"),
+                    item.get("quantity"),
+                    item.get("unit_price") or 0,
+                    item.get("amount") or 0,
+                    (item.get("color") or "").strip() or None,
+                    sample_date_value,
+                    item.get("remark"),
+                ),
+            )
+
+        db.commit()
+    except RuntimeError as exc:
+        db.rollback()
+        if str(exc) == "order_number_lock_timeout":
+            return jsonify({"msg": "订单编号生成繁忙，请稍后重试"}), 503
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if order_lock_acquired:
+            release_order_number_lock(cursor_plain)
+        db.close()
+
+    return jsonify({"msg": "order copied", "order_id": new_order_id, "order_number": new_order_number})
+
+
 @app.route("/api/orders/review", methods=["GET"])
 @auth_required()
 def get_orders_for_review():
@@ -754,7 +1584,7 @@ def get_orders_for_review():
     rejected_only = request.args.get("rejected_only") in ("1", "true", "True")
 
     query = [
-        "SELECT o.*, u.username AS clerk_name, rb.username AS rejected_by_name",
+        "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name, rb.username AS rejected_by_name",
         "FROM orders o",
         "LEFT JOIN users u ON u.id = o.clerk_id",
         "LEFT JOIN users rb ON rb.id = o.rejected_by",
@@ -884,4 +1714,8 @@ def approve_order(order_id):
 if __name__ == "__main__":
     print(f"[DB] host={MYSQL_HOST} port={MYSQL_PORT} db={MYSQL_DB} user={MYSQL_USER}")
     ensure_order_settlement_schema()
+    ensure_order_recipient_schema()
+    ensure_order_items_color_schema()
+    ensure_order_staff_schema()
+    ensure_order_draft_schema()
     app.run(debug=True)
