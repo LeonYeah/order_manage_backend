@@ -498,6 +498,33 @@ def add_user():
     return jsonify({"msg": "user created"})
 
 
+@app.route("/api/users/<int:user_id>/password", methods=["PUT"])
+@auth_required(required_role="admin")
+def update_user_password(user_id):
+    data = request.json or {}
+    password = data.get("password")
+
+    if not password:
+        return jsonify({"msg": "password is required"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+    user = cursor.fetchone()
+
+    if not user:
+        db.close()
+        return jsonify({"msg": "user not found"}), 404
+
+    cursor.execute(
+        "UPDATE users SET password=%s WHERE id=%s",
+        (hash_password(password), user_id),
+    )
+    db.commit()
+    db.close()
+    return jsonify({"msg": "password updated"})
+
+
 @app.route("/api/products", methods=["GET"])
 def get_products():
     db = get_db()
