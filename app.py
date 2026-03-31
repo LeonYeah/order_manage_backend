@@ -1,3 +1,4 @@
+import os
 from datetime import date, datetime, timedelta
 
 from flask import Flask, g, jsonify, request
@@ -1745,4 +1746,8 @@ if __name__ == "__main__":
     ensure_order_items_color_schema()
     ensure_order_staff_schema()
     ensure_order_draft_schema()
-    app.run(debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+    )
