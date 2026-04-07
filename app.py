@@ -526,6 +526,40 @@ def update_user_password(user_id):
     return jsonify({"msg": "password updated"})
 
 
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@auth_required(required_role="admin")
+def delete_user(user_id):
+    current_user_id = g.current_user.get("user_id")
+    if current_user_id == user_id:
+        return jsonify({"msg": "cannot delete current user"}), 400
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute("SELECT id, username FROM users WHERE id=%s", (user_id,))
+    user = cursor.fetchone()
+
+    if not user:
+        db.close()
+        return jsonify({"msg": "user not found"}), 404
+
+    cursor.execute("SELECT COUNT(1) AS total FROM orders WHERE clerk_id=%s OR rejected_by=%s", (user_id, user_id))
+    order_usage = cursor.fetchone()
+    cursor.execute("SELECT COUNT(1) AS total FROM draft_orders WHERE clerk_id=%s", (user_id,))
+    draft_usage = cursor.fetchone()
+
+    order_count = (order_usage or {}).get("total", 0)
+    draft_count = (draft_usage or {}).get("total", 0)
+    if order_count or draft_count:
+        db.close()
+        return jsonify({"msg": "该用户已关联订单或草稿，无法删除"}), 400
+
+    write_cursor = db.cursor()
+    write_cursor.execute("DELETE FROM users WHERE id=%s", (user_id,))
+    db.commit()
+    db.close()
+    return jsonify({"msg": "user deleted"})
+
+
 @app.route("/api/products", methods=["GET"])
 def get_products():
     db = get_db()
