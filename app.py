@@ -23,10 +23,13 @@ app.config["SECRET_KEY"] = SECRET_KEY
 SETTLEMENT_STATUS_UNSETTLED = "未结账"
 SETTLEMENT_STATUS_SETTLED = "已结账"
 SETTLEMENT_REMIND_DAYS = 3
-PAYMENT_METHODS = {"微信", "支付宝", "现金"}
+PAYMENT_METHODS = {"支付宝", "微信", "银城漆行二维码", "银城漆行对公", "艺彩对公", "百绘彩对公"}
 REVIEW_STATUS_PENDING = "未审核"
 REVIEW_STATUS_REJECTED = "已驳回"
 REVIEW_STATUS_APPROVED = "已通过"
+REVERSE_CHECKOUT_STATUS_NONE = "无"
+REVERSE_CHECKOUT_STATUS_PENDING = "待审核"
+REVERSE_CHECKOUT_STATUS_REJECTED = "已驳回"
 ORDER_NUMBER_LOCK_NAME = "orders_order_number_lock"
 
 
@@ -63,6 +66,18 @@ def ensure_order_settlement_schema():
         has_rejected_at = cursor.fetchone()
         cursor.execute("SHOW COLUMNS FROM orders LIKE 'resubmitted_at'")
         has_resubmitted_at = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'reverse_checkout_status'")
+        has_reverse_checkout_status = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'reverse_checkout_reason'")
+        has_reverse_checkout_reason = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'reverse_checkout_requested_by'")
+        has_reverse_checkout_requested_by = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'reverse_checkout_requested_at'")
+        has_reverse_checkout_requested_at = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'reverse_checkout_rejected_by'")
+        has_reverse_checkout_rejected_by = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'reverse_checkout_rejected_at'")
+        has_reverse_checkout_rejected_at = cursor.fetchone()
 
         if not has_status:
             cursor.execute(
@@ -105,6 +120,31 @@ def ensure_order_settlement_schema():
             cursor.execute(
                 "ALTER TABLE orders ADD COLUMN resubmitted_at DATETIME NULL AFTER rejected_at"
             )
+        if not has_reverse_checkout_status:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN reverse_checkout_status "
+                "ENUM('无','待审核','已驳回') NOT NULL DEFAULT '无' AFTER resubmitted_at"
+            )
+        if not has_reverse_checkout_reason:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN reverse_checkout_reason VARCHAR(500) NULL AFTER reverse_checkout_status"
+            )
+        if not has_reverse_checkout_requested_by:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN reverse_checkout_requested_by BIGINT NULL AFTER reverse_checkout_reason"
+            )
+        if not has_reverse_checkout_requested_at:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN reverse_checkout_requested_at DATETIME NULL AFTER reverse_checkout_requested_by"
+            )
+        if not has_reverse_checkout_rejected_by:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN reverse_checkout_rejected_by BIGINT NULL AFTER reverse_checkout_requested_at"
+            )
+        if not has_reverse_checkout_rejected_at:
+            cursor.execute(
+                "ALTER TABLE orders ADD COLUMN reverse_checkout_rejected_at DATETIME NULL AFTER reverse_checkout_rejected_by"
+            )
 
         cursor.execute(
             "UPDATE orders SET settlement_status='已结账' "
@@ -141,6 +181,10 @@ def ensure_order_settlement_schema():
         cursor.execute(
             "ALTER TABLE orders MODIFY COLUMN review_status "
             "ENUM('未审核','已驳回','已通过') NOT NULL DEFAULT '已通过'"
+        )
+        cursor.execute(
+            "UPDATE orders SET reverse_checkout_status='无' "
+            "WHERE reverse_checkout_status IS NULL OR reverse_checkout_status=''"
         )
         db.commit()
     finally:
@@ -185,6 +229,39 @@ def ensure_order_items_color_schema():
                 "ALTER TABLE order_items ADD COLUMN color VARCHAR(50) NULL AFTER amount"
             )
             db.commit()
+    finally:
+        db.close()
+
+
+def ensure_order_item_detail_schema():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        for table_name in ("order_items", "draft_order_items"):
+            cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE 'product_name'")
+            has_product_name = cursor.fetchone()
+            cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE 'product_code'")
+            has_product_code = cursor.fetchone()
+            cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE 'english_name'")
+            has_english_name = cursor.fetchone()
+            cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE 'capacity'")
+            has_capacity = cursor.fetchone()
+
+            if not has_product_name:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN product_name VARCHAR(100) NULL AFTER product_id")
+            if not has_product_code:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN product_code VARCHAR(100) NULL AFTER product_name")
+            if not has_english_name:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN english_name VARCHAR(100) NULL AFTER product_code")
+            if not has_capacity:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN capacity VARCHAR(100) NULL AFTER english_name")
+
+            try:
+                cursor.execute(f"ALTER TABLE {table_name} MODIFY COLUMN product_id BIGINT NULL")
+            except Exception:
+                pass
+
+        db.commit()
     finally:
         db.close()
 
@@ -253,7 +330,11 @@ def ensure_order_draft_schema():
             CREATE TABLE IF NOT EXISTS draft_order_items (
               id BIGINT NOT NULL AUTO_INCREMENT,
               draft_order_id BIGINT NOT NULL,
-              product_id BIGINT NOT NULL,
+              product_id BIGINT NULL,
+              product_name VARCHAR(100) NULL,
+              product_code VARCHAR(100) NULL,
+              english_name VARCHAR(100) NULL,
+              capacity VARCHAR(100) NULL,
               quantity INT NOT NULL DEFAULT 1,
               unit_price DECIMAL(10,2) NOT NULL DEFAULT 0,
               amount DECIMAL(10,2) NOT NULL DEFAULT 0,
@@ -267,6 +348,26 @@ def ensure_order_draft_schema():
               CONSTRAINT fk_draft_order_items_draft_order
                 FOREIGN KEY (draft_order_id) REFERENCES draft_orders(id)
                 ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def ensure_salesperson_schema():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS salespersons (
+              id BIGINT NOT NULL AUTO_INCREMENT,
+              name VARCHAR(100) NOT NULL,
+              created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              UNIQUE KEY uk_salespersons_name (name)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -300,6 +401,10 @@ def parse_order_date(value):
     raise ValueError("invalid_order_date")
 
 
+def normalize_item_text(value):
+    return (value or "").strip() or None
+
+
 def normalize_settlement_status(value):
     if value == SETTLEMENT_STATUS_UNSETTLED:
         return SETTLEMENT_STATUS_UNSETTLED
@@ -312,7 +417,7 @@ def normalize_payment_method(value, settlement_status):
         return None
     if method and method in PAYMENT_METHODS:
         return method
-    return "微信"
+    return "支付宝"
 
 
 def normalize_review_status(value):
@@ -321,6 +426,12 @@ def normalize_review_status(value):
     if value in (REVIEW_STATUS_PENDING, REVIEW_STATUS_REJECTED, REVIEW_STATUS_APPROVED):
         return value
     return REVIEW_STATUS_APPROVED
+
+
+def normalize_reverse_checkout_status(value):
+    if value in (REVERSE_CHECKOUT_STATUS_PENDING, REVERSE_CHECKOUT_STATUS_REJECTED):
+        return value
+    return REVERSE_CHECKOUT_STATUS_NONE
 
 
 def build_settlement_fields(existing_order, data):
@@ -364,6 +475,7 @@ def serialize_order_flags(order_row):
         if remind_active else 0
     )
     order_row["review_status"] = normalize_review_status(order_row.get("review_status"))
+    order_row["reverse_checkout_status"] = normalize_reverse_checkout_status(order_row.get("reverse_checkout_status"))
     return order_row
 
 
@@ -558,6 +670,66 @@ def delete_user(user_id):
     db.commit()
     db.close()
     return jsonify({"msg": "user deleted"})
+
+
+@app.route("/api/salespersons", methods=["GET"])
+@auth_required()
+def get_salespersons():
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute("SELECT id, name, created_at FROM salespersons ORDER BY id DESC")
+    salespersons = cursor.fetchall()
+    db.close()
+    return jsonify(salespersons)
+
+
+@app.route("/api/salespersons", methods=["POST"])
+@auth_required(required_role="admin")
+def add_salesperson():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"msg": "salesperson name is required"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM salespersons WHERE name=%s", (name,))
+    exists = cursor.fetchone()
+    if exists:
+        db.close()
+        return jsonify({"msg": "salesperson already exists"}), 400
+
+    cursor.execute("INSERT INTO salespersons (name) VALUES (%s)", (name,))
+    db.commit()
+    db.close()
+    return jsonify({"msg": "salesperson created"})
+
+
+@app.route("/api/salespersons/<int:salesperson_id>", methods=["DELETE"])
+@auth_required(required_role="admin")
+def delete_salesperson(salesperson_id):
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute("SELECT id, name FROM salespersons WHERE id=%s", (salesperson_id,))
+    salesperson = cursor.fetchone()
+    if not salesperson:
+        db.close()
+        return jsonify({"msg": "salesperson not found"}), 404
+
+    name = salesperson.get("name")
+    cursor.execute("SELECT COUNT(1) AS total FROM orders WHERE salesperson=%s", (name,))
+    order_usage = cursor.fetchone()
+    cursor.execute("SELECT COUNT(1) AS total FROM draft_orders WHERE salesperson=%s", (name,))
+    draft_usage = cursor.fetchone()
+    if (order_usage or {}).get("total", 0) or (draft_usage or {}).get("total", 0):
+        db.close()
+        return jsonify({"msg": "该业务员已关联订单或草稿，无法删除"}), 400
+
+    write_cursor = db.cursor()
+    write_cursor.execute("DELETE FROM salespersons WHERE id=%s", (salesperson_id,))
+    db.commit()
+    db.close()
+    return jsonify({"msg": "salesperson deleted"})
 
 
 @app.route("/api/products", methods=["GET"])
@@ -860,8 +1032,13 @@ def get_order_draft_detail(draft_id):
         return jsonify({"msg": "forbidden"}), 403
 
     cursor.execute(
-        "SELECT di.*, p.name AS product_name, p.product_code, p.english_name, p.capacity "
-        "FROM draft_order_items di JOIN products p ON p.id=di.product_id WHERE di.draft_order_id=%s ORDER BY di.id ASC",
+        "SELECT di.*, "
+        "COALESCE(di.product_name, p.name) AS product_name, "
+        "COALESCE(di.product_code, p.product_code) AS product_code, "
+        "COALESCE(di.english_name, p.english_name) AS english_name, "
+        "COALESCE(di.capacity, p.capacity) AS capacity "
+        "FROM draft_order_items di LEFT JOIN products p ON p.id=di.product_id "
+        "WHERE di.draft_order_id=%s ORDER BY di.id ASC",
         (draft_id,),
     )
     items = cursor.fetchall()
@@ -941,17 +1118,22 @@ def update_order_draft(draft_id):
         cursor_plain.execute("DELETE FROM draft_order_items WHERE draft_order_id=%s", (draft_id,))
 
         for item in items:
-            product_id = item.get("product_id")
-            if not product_id:
+            product_name = normalize_item_text(item.get("product_name"))
+            if not product_name:
                 continue
+            product_id = item.get("product_id") or None
             sample_date = item.get("sample_date")
             sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
             cursor_plain.execute(
-                "INSERT INTO draft_order_items (draft_order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO draft_order_items (draft_order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     draft_id,
                     product_id,
+                    product_name,
+                    normalize_item_text(item.get("product_code")),
+                    normalize_item_text(item.get("english_name")),
+                    normalize_item_text(item.get("capacity")),
                     int(item.get("quantity") or 1),
                     float(item.get("unit_price") or 0),
                     float(item.get("amount") or 0),
@@ -990,7 +1172,7 @@ def confirm_order_draft(draft_id):
         return jsonify({"msg": "forbidden"}), 403
 
     cursor.execute(
-        "SELECT product_id, quantity, unit_price, amount, color, sample_date, remark "
+        "SELECT product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark "
         "FROM draft_order_items WHERE draft_order_id=%s ORDER BY id ASC",
         (draft_id,),
     )
@@ -1062,11 +1244,15 @@ def confirm_order_draft(draft_id):
             sample_date = item.get("sample_date")
             sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
             cursor_plain.execute(
-                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO order_items (order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     order_id,
                     item.get("product_id"),
+                    normalize_item_text(item.get("product_name")),
+                    normalize_item_text(item.get("product_code")),
+                    normalize_item_text(item.get("english_name")),
+                    normalize_item_text(item.get("capacity")),
                     item.get("quantity") or 1,
                     item.get("unit_price") or 0,
                     item.get("amount") or 0,
@@ -1172,13 +1358,20 @@ def create_order():
         )
         order_id = cursor.lastrowid
         for item in items:
+            product_name = normalize_item_text(item.get("product_name"))
+            if not product_name:
+                continue
             sample_date = item.get("sample_date")
             sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
             cursor.execute(
-                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO order_items (order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     order_id,
-                    item["product_id"],
+                    item.get("product_id"),
+                    product_name,
+                    normalize_item_text(item.get("product_code")),
+                    normalize_item_text(item.get("english_name")),
+                    normalize_item_text(item.get("capacity")),
                     item["quantity"],
                     item.get("unit_price") or 0,
                     item.get("amount") or 0,
@@ -1324,8 +1517,12 @@ def get_order(order_id):
         return jsonify({"msg": "forbidden"}), 403
 
     cursor.execute(
-        "SELECT oi.*, p.name as product_name, p.product_code, p.english_name, p.capacity "
-        "FROM order_items oi JOIN products p ON oi.product_id=p.id WHERE oi.order_id=%s",
+        "SELECT oi.*, "
+        "COALESCE(oi.product_name, p.name) AS product_name, "
+        "COALESCE(oi.product_code, p.product_code) AS product_code, "
+        "COALESCE(oi.english_name, p.english_name) AS english_name, "
+        "COALESCE(oi.capacity, p.capacity) AS capacity "
+        "FROM order_items oi LEFT JOIN products p ON oi.product_id=p.id WHERE oi.order_id=%s",
         (order_id,),
     )
     items = cursor.fetchall()
@@ -1347,7 +1544,7 @@ def update_order(order_id):
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
     cursor.execute(
         "SELECT id, clerk_id, shipping_status, settlement_status, settlement_remind_until, settlement_at, "
-        "review_status, reject_reason, rejected_by, rejected_at, resubmitted_at "
+        "review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, reverse_checkout_status "
         "FROM orders WHERE id=%s",
         (order_id,),
     )
@@ -1360,6 +1557,8 @@ def update_order(order_id):
         return jsonify({"msg": "forbidden"}), 403
     try:
         if "items" in data:
+            if normalize_settlement_status(order.get("settlement_status")) == SETTLEMENT_STATUS_SETTLED:
+                return jsonify({"msg": "已结账订单需先提交反结账申请并经管理员审核后才能修改"}), 400
             items = data.get("items") or []
             customer_name = (data.get("customer_name") or "").strip()
             if not customer_name:
@@ -1439,14 +1638,21 @@ def update_order(order_id):
 
             cursor.execute("DELETE FROM order_items WHERE order_id=%s", (order_id,))
             for item in items:
+                product_name = normalize_item_text(item.get("product_name"))
+                if not product_name:
+                    continue
                 sample_date = item.get("sample_date")
                 sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
                 cursor.execute(
-                    "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "INSERT INTO order_items (order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         order_id,
-                        item["product_id"],
+                        item.get("product_id"),
+                        product_name,
+                        normalize_item_text(item.get("product_code")),
+                        normalize_item_text(item.get("english_name")),
+                        normalize_item_text(item.get("capacity")),
                         item["quantity"],
                         item.get("unit_price") or 0,
                         item.get("amount") or 0,
@@ -1473,6 +1679,181 @@ def update_order(order_id):
     finally:
         db.close()
     return jsonify({"msg": "order updated"})
+
+
+@app.route("/api/orders/reverse-checkout", methods=["GET"])
+@auth_required()
+def get_reverse_checkout_orders():
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    clerk_id = request.args.get("clerk_id", type=int)
+    customer_name = (request.args.get("customer_name") or "").strip()
+    order_number = (request.args.get("order_number") or "").strip()
+    reverse_status = (request.args.get("reverse_status") or "").strip()
+    rejected_only = request.args.get("rejected_only") in ("1", "true", "True")
+
+    query = [
+        "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name,",
+        "req.username AS reverse_checkout_requested_by_name,",
+        "rej.username AS reverse_checkout_rejected_by_name",
+        "FROM orders o",
+        "LEFT JOIN users u ON u.id = o.clerk_id",
+        "LEFT JOIN users req ON req.id = o.reverse_checkout_requested_by",
+        "LEFT JOIN users rej ON rej.id = o.reverse_checkout_rejected_by",
+        "WHERE o.settlement_status=%s",
+        "AND o.reverse_checkout_status<>%s",
+    ]
+    params = [SETTLEMENT_STATUS_SETTLED, REVERSE_CHECKOUT_STATUS_NONE]
+
+    if current_role != "admin":
+        query.append("AND o.clerk_id=%s")
+        params.append(current_user_id)
+    elif clerk_id:
+        query.append("AND o.clerk_id=%s")
+        params.append(clerk_id)
+
+    if customer_name:
+        query.append("AND o.customer_name LIKE %s")
+        params.append(f"%{customer_name}%")
+
+    if order_number:
+        query.append("AND o.order_number LIKE %s")
+        params.append(f"%{order_number}%")
+
+    if reverse_status:
+        query.append("AND o.reverse_checkout_status=%s")
+        params.append(reverse_status)
+
+    if rejected_only:
+        query.append("AND o.reverse_checkout_status=%s")
+        params.append(REVERSE_CHECKOUT_STATUS_REJECTED)
+
+    query.append("ORDER BY o.reverse_checkout_requested_at DESC, o.id DESC")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute(" ".join(query), params)
+    orders = [serialize_order_flags(order) for order in cursor.fetchall()]
+    db.close()
+    return jsonify(orders)
+
+
+@app.route("/api/orders/<int:order_id>/reverse-checkout", methods=["POST"])
+@auth_required()
+def request_reverse_checkout(order_id):
+    current_user = g.current_user
+    current_role = normalize_role(current_user.get("role"))
+    current_user_id = current_user.get("user_id")
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute(
+        "SELECT id, clerk_id, settlement_status, reverse_checkout_status FROM orders WHERE id=%s",
+        (order_id,),
+    )
+    order = cursor.fetchone()
+    if not order:
+        db.close()
+        return jsonify({"msg": "order not found"}), 404
+    if current_role != "admin" and order.get("clerk_id") != current_user_id:
+        db.close()
+        return jsonify({"msg": "forbidden"}), 403
+    if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_SETTLED:
+        db.close()
+        return jsonify({"msg": "仅已结账订单可提交反结账申请"}), 400
+    if normalize_reverse_checkout_status(order.get("reverse_checkout_status")) == REVERSE_CHECKOUT_STATUS_PENDING:
+        db.close()
+        return jsonify({"msg": "该订单已提交反结账审核，请勿重复提交"}), 400
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "UPDATE orders SET reverse_checkout_status=%s, reverse_checkout_reason=NULL, "
+        "reverse_checkout_requested_by=%s, reverse_checkout_requested_at=%s, "
+        "reverse_checkout_rejected_by=NULL, reverse_checkout_rejected_at=NULL WHERE id=%s",
+        (REVERSE_CHECKOUT_STATUS_PENDING, current_user_id, now, order_id),
+    )
+    db.commit()
+    db.close()
+    return jsonify({"msg": "reverse checkout requested"})
+
+
+@app.route("/api/orders/<int:order_id>/reverse-checkout/reject", methods=["POST"])
+@auth_required(required_role="admin")
+def reject_reverse_checkout(order_id):
+    data = request.json or {}
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify({"msg": "驳回原因不能为空"}), 400
+
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute(
+        "SELECT id, settlement_status, reverse_checkout_status FROM orders WHERE id=%s",
+        (order_id,),
+    )
+    order = cursor.fetchone()
+    if not order:
+        db.close()
+        return jsonify({"msg": "order not found"}), 404
+    if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_SETTLED:
+        db.close()
+        return jsonify({"msg": "仅已结账订单可驳回反结账申请"}), 400
+    if normalize_reverse_checkout_status(order.get("reverse_checkout_status")) != REVERSE_CHECKOUT_STATUS_PENDING:
+        db.close()
+        return jsonify({"msg": "当前订单没有待审核的反结账申请"}), 400
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "UPDATE orders SET reverse_checkout_status=%s, reverse_checkout_reason=%s, "
+        "reverse_checkout_rejected_by=%s, reverse_checkout_rejected_at=%s WHERE id=%s",
+        (REVERSE_CHECKOUT_STATUS_REJECTED, reason, g.current_user.get("user_id"), now, order_id),
+    )
+    db.commit()
+    db.close()
+    return jsonify({"msg": "reverse checkout rejected"})
+
+
+@app.route("/api/orders/<int:order_id>/reverse-checkout/approve", methods=["POST"])
+@auth_required(required_role="admin")
+def approve_reverse_checkout(order_id):
+    db = get_db()
+    cursor = db.cursor(MySQLdb.cursors.DictCursor)
+    cursor.execute(
+        "SELECT id, settlement_status, reverse_checkout_status FROM orders WHERE id=%s",
+        (order_id,),
+    )
+    order = cursor.fetchone()
+    if not order:
+        db.close()
+        return jsonify({"msg": "order not found"}), 404
+    if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_SETTLED:
+        db.close()
+        return jsonify({"msg": "仅已结账订单可审核反结账申请"}), 400
+    if normalize_reverse_checkout_status(order.get("reverse_checkout_status")) != REVERSE_CHECKOUT_STATUS_PENDING:
+        db.close()
+        return jsonify({"msg": "当前订单没有待审核的反结账申请"}), 400
+
+    now = datetime.now()
+    remind_until = now + timedelta(days=SETTLEMENT_REMIND_DAYS)
+    cursor.execute(
+        "UPDATE orders SET settlement_status=%s, payment_method=NULL, settlement_remind_until=%s, settlement_at=NULL, "
+        "review_status=%s, reject_reason=NULL, rejected_by=NULL, rejected_at=NULL, resubmitted_at=NULL, "
+        "reverse_checkout_status=%s, reverse_checkout_reason=NULL, reverse_checkout_requested_by=NULL, "
+        "reverse_checkout_requested_at=NULL, reverse_checkout_rejected_by=NULL, reverse_checkout_rejected_at=NULL "
+        "WHERE id=%s",
+        (
+            SETTLEMENT_STATUS_UNSETTLED,
+            remind_until.strftime("%Y-%m-%d %H:%M:%S"),
+            REVIEW_STATUS_PENDING,
+            REVERSE_CHECKOUT_STATUS_NONE,
+            order_id,
+        ),
+    )
+    db.commit()
+    db.close()
+    return jsonify({"msg": "reverse checkout approved"})
 
 
 @app.route("/api/orders/<int:order_id>", methods=["DELETE"])
@@ -1531,7 +1912,7 @@ def copy_order(order_id):
         return jsonify({"msg": "forbidden"}), 403
 
     cursor.execute(
-        "SELECT product_id, quantity, unit_price, amount, color, sample_date, remark "
+        "SELECT product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark "
         "FROM order_items WHERE order_id=%s ORDER BY id ASC",
         (order_id,),
     )
@@ -1601,11 +1982,15 @@ def copy_order(order_id):
             sample_date = item.get("sample_date")
             sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
             cursor_plain.execute(
-                "INSERT INTO order_items (order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO order_items (order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     new_order_id,
                     item.get("product_id"),
+                    normalize_item_text(item.get("product_name")),
+                    normalize_item_text(item.get("product_code")),
+                    normalize_item_text(item.get("english_name")),
+                    normalize_item_text(item.get("capacity")),
                     item.get("quantity"),
                     item.get("unit_price") or 0,
                     item.get("amount") or 0,
@@ -1778,8 +2163,10 @@ if __name__ == "__main__":
     ensure_order_settlement_schema()
     ensure_order_recipient_schema()
     ensure_order_items_color_schema()
+    ensure_order_item_detail_schema()
     ensure_order_staff_schema()
     ensure_order_draft_schema()
+    ensure_salesperson_schema()
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "5000")),
