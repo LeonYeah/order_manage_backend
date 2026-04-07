@@ -256,6 +256,24 @@ def ensure_order_item_detail_schema():
             if not has_capacity:
                 cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN capacity VARCHAR(100) NULL AFTER english_name")
 
+            cursor.execute(
+                """
+                SELECT CONSTRAINT_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = %s
+                  AND COLUMN_NAME = 'product_id'
+                  AND REFERENCED_TABLE_NAME IS NOT NULL
+                """,
+                (table_name,),
+            )
+            foreign_keys = cursor.fetchall() or []
+            for foreign_key in foreign_keys:
+                constraint_name = foreign_key[0] if isinstance(foreign_key, (list, tuple)) else foreign_key
+                if not constraint_name:
+                    continue
+                cursor.execute(f"ALTER TABLE {table_name} DROP FOREIGN KEY {constraint_name}")
+
             try:
                 cursor.execute(f"ALTER TABLE {table_name} MODIFY COLUMN product_id BIGINT NULL")
             except Exception:
@@ -898,8 +916,8 @@ def create_order_draft():
         draft_id = cursor.lastrowid
 
         for item in items:
-            product_id = item.get("product_id")
-            if not product_id:
+            product_name = normalize_item_text(item.get("product_name"))
+            if not product_name:
                 continue
             quantity = int(item.get("quantity") or 1)
             unit_price = float(item.get("unit_price") or 0)
@@ -909,11 +927,15 @@ def create_order_draft():
             sample_date_value = parse_order_date(sample_date).strftime("%Y-%m-%d") if sample_date else None
             item_remark = (item.get("remark") or "").strip() or None
             cursor.execute(
-                "INSERT INTO draft_order_items (draft_order_id, product_id, quantity, unit_price, amount, color, sample_date, remark) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO draft_order_items (draft_order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     draft_id,
-                    product_id,
+                    item.get("product_id") or None,
+                    product_name,
+                    normalize_item_text(item.get("product_code")),
+                    normalize_item_text(item.get("english_name")),
+                    normalize_item_text(item.get("capacity")),
                     quantity,
                     unit_price,
                     amount,
@@ -1248,7 +1270,7 @@ def confirm_order_draft(draft_id):
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     order_id,
-                    item.get("product_id"),
+                    item.get("product_id") or None,
                     normalize_item_text(item.get("product_name")),
                     normalize_item_text(item.get("product_code")),
                     normalize_item_text(item.get("english_name")),
@@ -1367,7 +1389,7 @@ def create_order():
                 "INSERT INTO order_items (order_id, product_id, product_name, product_code, english_name, capacity, quantity, unit_price, amount, color, sample_date, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     order_id,
-                    item.get("product_id"),
+                    item.get("product_id") or None,
                     product_name,
                     normalize_item_text(item.get("product_code")),
                     normalize_item_text(item.get("english_name")),
@@ -1648,7 +1670,7 @@ def update_order(order_id):
                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (
                         order_id,
-                        item.get("product_id"),
+                        item.get("product_id") or None,
                         product_name,
                         normalize_item_text(item.get("product_code")),
                         normalize_item_text(item.get("english_name")),
@@ -1986,7 +2008,7 @@ def copy_order(order_id):
                 "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     new_order_id,
-                    item.get("product_id"),
+                    item.get("product_id") or None,
                     normalize_item_text(item.get("product_name")),
                     normalize_item_text(item.get("product_code")),
                     normalize_item_text(item.get("english_name")),
