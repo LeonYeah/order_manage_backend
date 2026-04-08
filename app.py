@@ -1,4 +1,4 @@
-import os
+﻿import os
 from datetime import date, datetime, timedelta
 
 from flask import Flask, g, jsonify, request
@@ -146,6 +146,10 @@ def ensure_order_settlement_schema():
                 "ALTER TABLE orders ADD COLUMN reverse_checkout_rejected_at DATETIME NULL AFTER reverse_checkout_rejected_by"
             )
 
+        try:
+            cursor.execute("ALTER TABLE orders MODIFY COLUMN payment_method VARCHAR(50) NULL")
+        except Exception:
+            pass
         cursor.execute(
             "UPDATE orders SET settlement_status='已结账' "
             "WHERE settlement_status IS NULL OR settlement_status=''"
@@ -369,6 +373,10 @@ def ensure_order_draft_schema():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        try:
+            cursor.execute("ALTER TABLE draft_orders MODIFY COLUMN payment_method VARCHAR(50) NULL")
+        except Exception:
+            pass
         db.commit()
     finally:
         db.close()
@@ -681,7 +689,7 @@ def delete_user(user_id):
     draft_count = (draft_usage or {}).get("total", 0)
     if order_count or draft_count:
         db.close()
-        return jsonify({"msg": "该用户已关联订单或草稿，无法删除"}), 400
+        return jsonify({"msg": "璇ョ敤鎴峰凡鍏宠仈璁㈠崟鎴栬崏绋匡紝鏃犳硶鍒犻櫎"}), 400
 
     write_cursor = db.cursor()
     write_cursor.execute("DELETE FROM users WHERE id=%s", (user_id,))
@@ -844,7 +852,7 @@ def batch_delete_products():
         used_products = cursor.fetchall()
         if used_products:
             used_names = [item.get("name") or str(item.get("id")) for item in used_products]
-            return jsonify({"msg": f"以下商品已被订单使用，无法删除：{','.join(used_names)}"}), 400
+            return jsonify({"msg": f"浠ヤ笅鍟嗗搧宸茶璁㈠崟浣跨敤锛屾棤娉曞垹闄わ細{','.join(used_names)}"}), 400
 
         cursor.execute(
             f"DELETE FROM products WHERE id IN ({placeholders})",
@@ -1289,7 +1297,7 @@ def confirm_order_draft(draft_id):
     except RuntimeError as exc:
         db.rollback()
         if str(exc) == "order_number_lock_timeout":
-            return jsonify({"msg": "订单编号生成繁忙，请稍后重试"}), 503
+            return jsonify({"msg": "璁㈠崟缂栧彿鐢熸垚绻佸繖锛岃绋嶅悗閲嶈瘯"}), 503
         raise
     except Exception:
         db.rollback()
@@ -1406,7 +1414,7 @@ def create_order():
     except RuntimeError as exc:
         db.rollback()
         if str(exc) == "order_number_lock_timeout":
-            return jsonify({"msg": "订单编号生成繁忙，请稍后重试"}), 503
+            return jsonify({"msg": "璁㈠崟缂栧彿鐢熸垚绻佸繖锛岃绋嶅悗閲嶈瘯"}), 503
         raise
     except Exception:
         db.rollback()
@@ -1580,7 +1588,7 @@ def update_order(order_id):
     try:
         if "items" in data:
             if normalize_settlement_status(order.get("settlement_status")) == SETTLEMENT_STATUS_SETTLED:
-                return jsonify({"msg": "已结账订单需先提交反结账申请并经管理员审核后才能修改"}), 400
+                return jsonify({"msg": "宸茬粨璐﹁鍗曢渶鍏堟彁浜ゅ弽缁撹处鐢宠骞剁粡绠＄悊鍛樺鏍稿悗鎵嶈兘淇敼"}), 400
             items = data.get("items") or []
             customer_name = (data.get("customer_name") or "").strip()
             if not customer_name:
@@ -1784,10 +1792,10 @@ def request_reverse_checkout(order_id):
         return jsonify({"msg": "forbidden"}), 403
     if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_SETTLED:
         db.close()
-        return jsonify({"msg": "仅已结账订单可提交反结账申请"}), 400
+        return jsonify({"msg": "浠呭凡缁撹处璁㈠崟鍙彁浜ゅ弽缁撹处鐢宠"}), 400
     if normalize_reverse_checkout_status(order.get("reverse_checkout_status")) == REVERSE_CHECKOUT_STATUS_PENDING:
         db.close()
-        return jsonify({"msg": "该订单已提交反结账审核，请勿重复提交"}), 400
+        return jsonify({"msg": "璇ヨ鍗曞凡鎻愪氦鍙嶇粨璐﹀鏍革紝璇峰嬁閲嶅鎻愪氦"}), 400
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
@@ -1807,7 +1815,7 @@ def reject_reverse_checkout(order_id):
     data = request.json or {}
     reason = (data.get("reason") or "").strip()
     if not reason:
-        return jsonify({"msg": "驳回原因不能为空"}), 400
+        return jsonify({"msg": "椹冲洖鍘熷洜涓嶈兘涓虹┖"}), 400
 
     db = get_db()
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
@@ -1821,7 +1829,7 @@ def reject_reverse_checkout(order_id):
         return jsonify({"msg": "order not found"}), 404
     if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_SETTLED:
         db.close()
-        return jsonify({"msg": "仅已结账订单可驳回反结账申请"}), 400
+        return jsonify({"msg": "浠呭凡缁撹处璁㈠崟鍙┏鍥炲弽缁撹处鐢宠"}), 400
     if normalize_reverse_checkout_status(order.get("reverse_checkout_status")) != REVERSE_CHECKOUT_STATUS_PENDING:
         db.close()
         return jsonify({"msg": "当前订单没有待审核的反结账申请"}), 400
@@ -1852,7 +1860,7 @@ def approve_reverse_checkout(order_id):
         return jsonify({"msg": "order not found"}), 404
     if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_SETTLED:
         db.close()
-        return jsonify({"msg": "仅已结账订单可审核反结账申请"}), 400
+        return jsonify({"msg": "浠呭凡缁撹处璁㈠崟鍙鏍稿弽缁撹处鐢宠"}), 400
     if normalize_reverse_checkout_status(order.get("reverse_checkout_status")) != REVERSE_CHECKOUT_STATUS_PENDING:
         db.close()
         return jsonify({"msg": "当前订单没有待审核的反结账申请"}), 400
@@ -2026,7 +2034,7 @@ def copy_order(order_id):
     except RuntimeError as exc:
         db.rollback()
         if str(exc) == "order_number_lock_timeout":
-            return jsonify({"msg": "订单编号生成繁忙，请稍后重试"}), 503
+            return jsonify({"msg": "璁㈠崟缂栧彿鐢熸垚绻佸繖锛岃绋嶅悗閲嶈瘯"}), 503
         raise
     except Exception:
         db.rollback()
@@ -2100,7 +2108,7 @@ def reject_order(order_id):
     data = request.json or {}
     reason = (data.get("reason") or "").strip()
     if not reason:
-        return jsonify({"msg": "驳回原因不能为空"}), 400
+        return jsonify({"msg": "椹冲洖鍘熷洜涓嶈兘涓虹┖"}), 400
 
     db = get_db()
     cursor = db.cursor(MySQLdb.cursors.DictCursor)
@@ -2169,7 +2177,7 @@ def approve_order(order_id):
         return jsonify({"msg": "order not found"}), 404
     if normalize_settlement_status(order.get("settlement_status")) != SETTLEMENT_STATUS_UNSETTLED:
         db.close()
-        return jsonify({"msg": "仅未结账订单可审核通过"}), 400
+        return jsonify({"msg": "浠呮湭缁撹处璁㈠崟鍙鏍搁€氳繃"}), 400
 
     cursor.execute(
         "UPDATE orders SET review_status=%s, reject_reason=NULL, rejected_by=NULL, rejected_at=NULL WHERE id=%s",
