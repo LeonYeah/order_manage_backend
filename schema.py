@@ -1,6 +1,11 @@
 from db import get_db
 
 
+def ignore_duplicate_column(exc):
+    if not exc.args or exc.args[0] != 1060:
+        raise exc
+
+
 def ensure_order_settlement_schema():
     db = get_db()
     cursor = db.cursor()
@@ -158,6 +163,8 @@ def ensure_order_recipient_schema():
     try:
         cursor.execute("SHOW COLUMNS FROM orders LIKE 'recipient_name'")
         has_recipient_name = cursor.fetchone()
+        cursor.execute("SHOW COLUMNS FROM orders LIKE 'customer_phone'")
+        has_customer_phone = cursor.fetchone()
         cursor.execute("SHOW COLUMNS FROM orders LIKE 'recipient_address'")
         has_recipient_address = cursor.fetchone()
 
@@ -165,6 +172,13 @@ def ensure_order_recipient_schema():
             cursor.execute(
                 "ALTER TABLE orders ADD COLUMN recipient_name VARCHAR(100) NULL AFTER customer_name"
             )
+        if not has_customer_phone:
+            try:
+                cursor.execute(
+                    "ALTER TABLE orders ADD COLUMN customer_phone VARCHAR(50) NULL AFTER recipient_name"
+                )
+            except Exception as exc:
+                ignore_duplicate_column(exc)
         if not has_recipient_address:
             cursor.execute(
                 "ALTER TABLE orders ADD COLUMN recipient_address VARCHAR(255) NULL AFTER recipient_name"
@@ -283,6 +297,7 @@ def ensure_order_draft_schema():
             CREATE TABLE IF NOT EXISTS draft_orders (
               id BIGINT NOT NULL AUTO_INCREMENT,
               customer_name VARCHAR(100) NULL,
+              customer_phone VARCHAR(50) NULL,
               salesperson VARCHAR(100) NULL,
               recipient_name VARCHAR(100) NULL,
               recipient_address VARCHAR(255) NULL,
@@ -329,6 +344,15 @@ def ensure_order_draft_schema():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+        cursor.execute("SHOW COLUMNS FROM draft_orders LIKE 'customer_phone'")
+        has_draft_customer_phone = cursor.fetchone()
+        if not has_draft_customer_phone:
+            try:
+                cursor.execute(
+                    "ALTER TABLE draft_orders ADD COLUMN customer_phone VARCHAR(50) NULL AFTER customer_name"
+                )
+            except Exception as exc:
+                ignore_duplicate_column(exc)
         try:
             cursor.execute("ALTER TABLE draft_orders MODIFY COLUMN payment_method VARCHAR(50) NULL")
         except Exception:

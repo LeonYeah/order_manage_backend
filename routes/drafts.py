@@ -42,6 +42,7 @@ def create_order_draft():
             clerk_id = current_user_id
         order_clerk = get_username_by_user_id(cursor, clerk_id)
         customer_name = (data.get("customer_name") or "").strip() or None
+        customer_phone = (data.get("customer_phone") or "").strip() or None
         salesperson = (data.get("salesperson") or "").strip() or None
         recipient_name = (data.get("recipient_name") or "").strip() or None
         recipient_address = (data.get("recipient_address") or "").strip() or None
@@ -53,11 +54,12 @@ def create_order_draft():
         remark = (data.get("remark") or "").strip() or None
 
         cursor.execute(
-            "INSERT INTO draft_orders (customer_name, salesperson, recipient_name, recipient_address, clerk_id, order_clerk, "
+            "INSERT INTO draft_orders (customer_name, customer_phone, salesperson, recipient_name, recipient_address, clerk_id, order_clerk, "
             "order_date, shipping_fee, discount_amount, total_amount, settlement_status, payment_method, remark) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 customer_name,
+                customer_phone,
                 salesperson,
                 recipient_name,
                 recipient_address,
@@ -265,6 +267,7 @@ def update_order_draft(draft_id):
 
     clerk_id = draft.get("clerk_id")
     order_clerk = get_username_by_user_id(cursor_plain, clerk_id)
+    customer_phone = (data.get("customer_phone") or "").strip() or None
     salesperson = (data.get("salesperson") or "").strip() or None
     recipient_name = (data.get("recipient_name") or customer_name).strip()
     recipient_address = (data.get("recipient_address") or "").strip() or None
@@ -277,11 +280,12 @@ def update_order_draft(draft_id):
 
     try:
         cursor_plain.execute(
-            "UPDATE draft_orders SET customer_name=%s, salesperson=%s, recipient_name=%s, recipient_address=%s, "
+            "UPDATE draft_orders SET customer_name=%s, customer_phone=%s, salesperson=%s, recipient_name=%s, recipient_address=%s, "
             "order_clerk=%s, order_date=%s, shipping_fee=%s, discount_amount=%s, total_amount=%s, "
             "settlement_status=%s, payment_method=%s, remark=%s WHERE id=%s",
             (
                 customer_name,
+                customer_phone,
                 salesperson,
                 recipient_name,
                 recipient_address,
@@ -376,6 +380,7 @@ def confirm_order_draft(draft_id):
     review_status = get_default_review_status_for_settlement(settlement_status)
     clerk_id = draft.get("clerk_id")
     order_clerk = (draft.get("order_clerk") or "").strip() or get_username_by_user_id(cursor_plain, clerk_id)
+    customer_phone = (draft.get("customer_phone") or "").strip() or None
     salesperson = (draft.get("salesperson") or "").strip() or None
     recipient_name = (draft.get("recipient_name") or customer_name).strip()
     recipient_address = (draft.get("recipient_address") or "").strip() or None
@@ -390,13 +395,14 @@ def confirm_order_draft(draft_id):
         order_lock_acquired = True
         order_number = generate_order_number(cursor_plain, order_date)
         cursor_plain.execute(
-            "INSERT INTO orders (order_number, customer_name, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, "
+            "INSERT INTO orders (order_number, customer_name, customer_phone, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, "
             "shipping_fee, discount_amount, total_amount, payment_method, settlement_status, settlement_remind_until, settlement_at, review_status, "
             "reject_reason, rejected_by, rejected_at, resubmitted_at, remark) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 order_number,
                 customer_name,
+                customer_phone,
                 recipient_name,
                 recipient_address,
                 clerk_id,

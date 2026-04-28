@@ -85,17 +85,19 @@ def create_order():
         discount_amount = float(data.get("discount_amount") or 0)
         total_amount = float(data.get("total_amount") or 0)
         recipient_name = (data.get("recipient_name") or customer_name).strip()
+        customer_phone = (data.get("customer_phone") or "").strip() or None
         recipient_address = (data.get("recipient_address") or "").strip() or None
         settlement_status, payment_method, settlement_remind_until, settlement_at = build_settlement_fields(None, data)
         review_status = get_default_review_status_for_settlement(settlement_status)
         remark = data.get("remark")
 
         cursor.execute(
-            "INSERT INTO orders (order_number, customer_name, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, shipping_fee, discount_amount, total_amount, payment_method, settlement_status, settlement_remind_until, settlement_at, review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO orders (order_number, customer_name, recipient_name, customer_phone, recipient_address, clerk_id, order_clerk, salesperson, order_date, shipping_fee, discount_amount, total_amount, payment_method, settlement_status, settlement_remind_until, settlement_at, review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, remark) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 order_number,
                 customer_name,
                 recipient_name,
+                customer_phone,
                 recipient_address,
                 clerk_id,
                 order_clerk,
@@ -172,12 +174,16 @@ def get_orders():
     review_status = (request.args.get("review_status") or "").strip()
     salesperson = (request.args.get("salesperson") or "").strip()
     order_number = (request.args.get("order_number") or "").strip()
+    product_code = (request.args.get("product_code") or "").strip()
     start_date = (request.args.get("start_date") or "").strip()
     end_date = (request.args.get("end_date") or "").strip()
     reminder_only = request.args.get("reminder_only") in ("1", "true", "True")
 
     query = [
-        "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name, rb.username AS rejected_by_name",
+        "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name, rb.username AS rejected_by_name, "
+        "(SELECT GROUP_CONCAT(DISTINCT COALESCE(NULLIF(oi2.product_code, ''), p2.product_code) SEPARATOR ', ') "
+        "FROM order_items oi2 LEFT JOIN products p2 ON p2.id = oi2.product_id "
+        "WHERE oi2.order_id = o.id) AS product_codes",
         "FROM orders o",
         "LEFT JOIN users u ON u.id = o.clerk_id",
         "LEFT JOIN users rb ON rb.id = o.rejected_by",
@@ -219,6 +225,22 @@ def get_orders():
     if order_number:
         query.append("AND o.order_number LIKE %s")
         params.append(f"%{order_number}%")
+
+    if product_code:
+        product_code_like = f"%{product_code}%"
+        query.append(
+            "AND EXISTS ("
+            "SELECT 1 FROM order_items oi "
+            "LEFT JOIN products p ON p.id = oi.product_id "
+            "WHERE oi.order_id = o.id "
+            "AND ("
+            "oi.product_code LIKE %s "
+            "OR p.product_code LIKE %s "
+            "OR CONCAT(COALESCE(oi.product_code, ''), '/', COALESCE(oi.color, '')) LIKE %s"
+            ")"
+            ")"
+        )
+        params.extend([product_code_like, product_code_like, product_code_like])
 
     if start_date:
         try:
@@ -338,6 +360,7 @@ def update_order(order_id):
             discount_amount = float(data.get("discount_amount") or 0)
             total_amount = float(data.get("total_amount") or 0)
             recipient_name = (data.get("recipient_name") or customer_name).strip()
+            customer_phone = (data.get("customer_phone") or "").strip() or None
             recipient_address = (data.get("recipient_address") or "").strip() or None
             salesperson = (data.get("salesperson") or "").strip() or None
             settlement_status, payment_method, settlement_remind_until, settlement_at = build_settlement_fields(order, data)
@@ -366,13 +389,14 @@ def update_order(order_id):
             remark = data.get("remark")
 
             cursor.execute(
-                "UPDATE orders SET customer_name=%s, recipient_name=%s, recipient_address=%s, order_date=%s, shipping_status=%s, shipping_time=%s, "
+                "UPDATE orders SET customer_name=%s, recipient_name=%s, customer_phone=%s, recipient_address=%s, order_date=%s, shipping_status=%s, shipping_time=%s, "
                 "tracking_number=%s, payment_method=%s, settlement_status=%s, settlement_remind_until=%s, settlement_at=%s, "
                 "review_status=%s, reject_reason=%s, rejected_by=%s, rejected_at=%s, resubmitted_at=%s, "
                 "total_amount=%s, shipping_fee=%s, discount_amount=%s, salesperson=%s, remark=%s WHERE id=%s",
                 (
                     customer_name,
                     recipient_name,
+                    customer_phone,
                     recipient_address,
                     order_date.strftime("%Y-%m-%d"),
                     shipping_status,
@@ -705,14 +729,15 @@ def copy_order(order_id):
         order_lock_acquired = True
         new_order_number = generate_order_number(cursor_plain, new_order_date)
         cursor_plain.execute(
-            "INSERT INTO orders (order_number, customer_name, recipient_name, recipient_address, clerk_id, order_clerk, salesperson, order_date, "
+            "INSERT INTO orders (order_number, customer_name, recipient_name, customer_phone, recipient_address, clerk_id, order_clerk, salesperson, order_date, "
             "shipping_status, shipping_time, tracking_number, shipping_fee, discount_amount, total_amount, payment_method, "
             "settlement_status, settlement_remind_until, settlement_at, review_status, reject_reason, rejected_by, rejected_at, resubmitted_at, remark) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 new_order_number,
                 source_order.get("customer_name"),
                 source_order.get("recipient_name"),
+                source_order.get("customer_phone"),
                 source_order.get("recipient_address"),
                 clerk_id,
                 order_clerk,
