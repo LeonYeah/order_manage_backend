@@ -35,6 +35,14 @@ from utils.auth import auth_required
 bp = Blueprint("orders", __name__)
 
 
+def is_shipped_status(value):
+    return (value or "").strip() == "已发货"
+
+
+def is_submitted_locked(order):
+    return is_shipped_status(order.get("shipping_status"))
+
+
 @bp.route("/api/orders/next-number", methods=["GET"])
 @auth_required()
 def get_next_order_number():
@@ -175,6 +183,7 @@ def get_orders():
     salesperson = (request.args.get("salesperson") or "").strip()
     order_number = (request.args.get("order_number") or "").strip()
     product_code = (request.args.get("product_code") or "").strip()
+    product_name = (request.args.get("product_name") or "").strip()
     start_date = (request.args.get("start_date") or "").strip()
     end_date = (request.args.get("end_date") or "").strip()
     reminder_only = request.args.get("reminder_only") in ("1", "true", "True")
@@ -183,7 +192,10 @@ def get_orders():
         "SELECT o.*, COALESCE(o.order_clerk, u.username) AS clerk_name, rb.username AS rejected_by_name, "
         "(SELECT GROUP_CONCAT(DISTINCT COALESCE(NULLIF(oi2.product_code, ''), p2.product_code) SEPARATOR ', ') "
         "FROM order_items oi2 LEFT JOIN products p2 ON p2.id = oi2.product_id "
-        "WHERE oi2.order_id = o.id) AS product_codes",
+        "WHERE oi2.order_id = o.id) AS product_codes, "
+        "(SELECT GROUP_CONCAT(COALESCE(NULLIF(oi3.product_name, ''), p3.name) ORDER BY oi3.id ASC SEPARATOR ', ') "
+        "FROM order_items oi3 LEFT JOIN products p3 ON p3.id = oi3.product_id "
+        "WHERE oi3.order_id = o.id) AS product_names",
         "FROM orders o",
         "LEFT JOIN users u ON u.id = o.clerk_id",
         "LEFT JOIN users rb ON rb.id = o.rejected_by",
@@ -241,6 +253,21 @@ def get_orders():
             ")"
         )
         params.extend([product_code_like, product_code_like, product_code_like])
+
+    if product_name and current_role == "admin":
+        product_name_like = f"%{product_name}%"
+        query.append(
+            "AND EXISTS ("
+            "SELECT 1 FROM order_items oi "
+            "LEFT JOIN products p ON p.id = oi.product_id "
+            "WHERE oi.order_id = o.id "
+            "AND ("
+            "oi.product_name LIKE %s "
+            "OR p.name LIKE %s"
+            ")"
+            ")"
+        )
+        params.extend([product_name_like, product_name_like])
 
     if start_date:
         try:
@@ -446,14 +473,19 @@ def update_order(order_id):
                     ),
                 )
         else:
+            if is_submitted_locked(order):
+                return jsonify({"msg": "订单已提交，如需修改请先申请反结账"}), 400
             shipping_status = data.get("shipping_status") or order.get("shipping_status") or "未发货"
             tracking_number = (data.get("tracking_number") or "").strip() or None
-            remark = data.get("remark")
-            shipping_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if shipping_status == "已发货" else None
+            if not is_shipped_status(shipping_status):
+                return jsonify({"msg": "请先将发货状态设置为已发货"}), 400
+            if not tracking_number:
+                return jsonify({"msg": "请填写运单号"}), 400
+            shipping_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             cursor.execute(
-                "UPDATE orders SET shipping_status=%s, shipping_time=%s, tracking_number=%s, remark=%s WHERE id=%s",
-                (shipping_status, shipping_time, tracking_number, remark, order_id),
+                "UPDATE orders SET shipping_status=%s, shipping_time=%s, tracking_number=%s WHERE id=%s",
+                (shipping_status, shipping_time, tracking_number, order_id),
             )
 
         db.commit()
@@ -623,6 +655,7 @@ def approve_reverse_checkout(order_id):
     remind_until = now + timedelta(days=SETTLEMENT_REMIND_DAYS)
     cursor.execute(
         "UPDATE orders SET settlement_status=%s, payment_method=NULL, settlement_remind_until=%s, settlement_at=NULL, "
+        "shipping_status=%s, shipping_time=NULL, tracking_number=NULL, "
         "review_status=%s, reject_reason=NULL, rejected_by=NULL, rejected_at=NULL, resubmitted_at=NULL, "
         "reverse_checkout_status=%s, reverse_checkout_reason=NULL, reverse_checkout_requested_by=NULL, "
         "reverse_checkout_requested_at=NULL, reverse_checkout_rejected_by=NULL, reverse_checkout_rejected_at=NULL "
@@ -630,6 +663,7 @@ def approve_reverse_checkout(order_id):
         (
             SETTLEMENT_STATUS_UNSETTLED,
             remind_until.strftime("%Y-%m-%d %H:%M:%S"),
+            "未发货",
             REVIEW_STATUS_PENDING,
             REVERSE_CHECKOUT_STATUS_NONE,
             order_id,
